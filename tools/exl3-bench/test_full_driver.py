@@ -219,12 +219,16 @@ class FakeModel:
 
     def prefill(self, input_ids, params):
         """Model.prefill: writes cache/state, advances recurrence, returns no logits."""
+        if getattr(self, "require_inference", False) and not torch.is_inference_mode_enabled():
+            raise RuntimeError("Inplace update to inference tensor outside InferenceMode is not allowed.")
         self.prefill_calls = getattr(self, "prefill_calls", 0) + 1
         self._write(input_ids, params)
         return None
 
     def forward(self, input_ids, params):
-        seqlen = int(params["cache_seqlens"][0])
+        if getattr(self, "require_inference", False) and not torch.is_inference_mode_enabled():
+            raise RuntimeError("Inplace update to inference tensor outside InferenceMode is not allowed.")
+        seqlen = int(params["cache_seqlens"].reshape(-1)[0])
         rows = int(input_ids.shape[1])
         st = (params.get("recurrent_states") or [None])[0]
         self._write(input_ids, params)
@@ -586,6 +590,27 @@ def test_full_driver_prefill_entrypoint_matches_the_source_dispatch(monkeypatch,
         positions = [c["positions"] for c in rec[name]["calls"] if c["positions"]]
         assert positions, "no positions recorded"
         assert all(len(p) == 1 for p in positions), positions[:3]
+
+
+def test_replay_runs_under_inference_mode(gdn, fp16):
+    """The loaded model's tensors are inference tensors; replay outside inference mode is a real crash
+    (window 1792766228047680624-502983). Both entrypoints must be replayed inside the context."""
+    model = FakeModel()
+    model.require_inference = True
+    calls = [probe.CallRecord(seq=0, batch=1, cols=P - 1, cache_seqlens=0, block_row=[0, 1],
+                              positions=[], recurrent_history=False,
+                              input_ids=[PROMPT[:P - 1]], method="prefill")]
+    for k in range(3):
+        tok = PROMPT[P - 1] if k == 0 else GEN[k - 1]
+        calls.append(probe.CallRecord(seq=k + 1, batch=1, cols=1, cache_seqlens=P - 1 + k,
+                                      block_row=[0, 1], positions=[P - 1 + k],
+                                      recurrent_history=False, input_ids=[[tok]], method="forward"))
+    cache = FakeCache(gdn, fp16)
+    state = real_state(gdn["GDNState"], cache)
+    for call in calls:
+        probe.replay_one(call, cache, state, model)          # would raise if not inference-mode
+    out = probe.issue_control_rows(calls[-1], [GEN[2], 1, 2], cache, state, model)
+    assert out.shape == (3, VOCAB)
 
 
 def test_positions_adapter_rejects_a_token_grid():

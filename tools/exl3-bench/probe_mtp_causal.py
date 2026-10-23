@@ -566,7 +566,9 @@ def issue_control_rows(recorded_call, rows, cache, state, model):
               "recurrent_states": [state], "recurrent_history": False, "pinned_staging": True}
     if positions:
         params["positions"] = torch.tensor([positions], dtype=torch.int32)
-    return model.forward(torch.tensor([rows], dtype=torch.long), params)[0].detach().to(torch.float32).cpu()
+    with torch.inference_mode():
+        out = model.forward(torch.tensor([rows], dtype=torch.long), params)
+    return out[0].detach().to(torch.float32).cpu()
 
 
 # ----------------------------------------------------------------------------- report helpers
@@ -592,7 +594,7 @@ def write_json(rec: dict, path: str) -> None:
 
 # ----------------------------------------------------------------------------- driver
 
-def provenance_manifest(args) -> dict:
+def provenance_manifest(args, ext_module=None) -> dict:
     """Startup identity written before any allocation: sources, extension, script and the runtime
     libraries this process will load. No credentials, no environment dump."""
     import platform
@@ -620,7 +622,16 @@ def provenance_manifest(args) -> dict:
     except OSError:
         pass
     src_root = os.environ.get("FORK") or os.path.expanduser("~/exl3-v164-rocm10-port")
+    ext_identity = None
+    if ext_module is not None:
+        try:
+            ext_path = os.path.realpath(ext_module.__file__)
+            ext_identity = {"path": ext_path, "sha256": _file_sha(ext_path)}
+        except OSError as exc:
+            ext_identity = {"path": getattr(ext_module, "__file__", None),
+                            "sha256": f"unreadable: {type(exc).__name__}"}
     return {
+        "ext": ext_identity,
         "when": __import__("datetime").datetime.now().astimezone().isoformat(),
         "host": platform.node(), "python": sys.version.split()[0], "argv": sys.argv,
         "torch": torch.__version__, "torch_hip": torch.version.hip,
@@ -654,7 +665,7 @@ def run(args) -> dict:
            "ext_file": os.path.realpath(exl_ext.exllamav3_ext.__file__),
            "index": args.index, "filler": args.filler}
 
-    rec["provenance"] = provenance_manifest(args)
+    rec["provenance"] = provenance_manifest(args, exl_ext.exllamav3_ext)
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
     tok = Tokenizer.from_config(config)
@@ -918,12 +929,16 @@ def replay_one(call, cache, state, model):
     block = torch.tensor([list(range(used)) + [0] * (len(call.block_row) - used)], dtype=torch.int32)
     params = _replay_params(call, cache, state, block)
     ids = torch.tensor(call.input_ids, dtype=torch.long)
-    if call.method == "prefill":
-        out = model.prefill(ids, params)     # Model.prefill does not call forward (model.py:368-389)
-    elif call.method == "forward":
-        out = model.forward(ids, params)
-    else:
-        raise ProbeError(f"unknown recorded entrypoint {call.method!r}")
+    # the loaded model's weights and cache are inference tensors: the generator always calls it inside
+    # inference mode, so a replay outside it dies with "Inplace update to inference tensor outside
+    # InferenceMode" on the first cache/state write (observed in window 1792766228047680624-502983).
+    with torch.inference_mode():
+        if call.method == "prefill":
+            out = model.prefill(ids, params)   # Model.prefill does not call forward (model.py:368-389)
+        elif call.method == "forward":
+            out = model.forward(ids, params)
+        else:
+            raise ProbeError(f"unknown recorded entrypoint {call.method!r}")
     if out is None:
         return None
     return out[0].detach().to(torch.float32).cpu()
