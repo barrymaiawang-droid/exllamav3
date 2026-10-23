@@ -125,4 +125,10 @@ def test_ornith_lm_head_full_width(device):
     assert C.shape == (1, n)
     assert torch.isfinite(C).all()
     rel_rms, rel_max = _check(C[:, :ref_tiles * 16], ref)
-    assert rel_rms < 2.5e-3 and rel_max < 4e-3, f"lm_head: rel_rms {rel_rms:.2e} rel_max {rel_max:.2e}"
+    assert rel_rms < 2.5e-3 and rel_max < 4e-3, f"lm_head head: rel_rms {rel_rms:.2e} rel_max {rel_max:.2e}"
+    # tail: the last tiles are the ones a truncated grid or an off-by-one tile count would leave wrong
+    tail = n // 16 - ref_tiles
+    ref_tail = tref.linear(A, p[:, tail:], suh, svh[tail * 16:], K, "mul1")
+    rel_rms_t, rel_max_t = _check(C[:, tail * 16:], ref_tail)
+    assert rel_rms_t < 2.5e-3 and rel_max_t < 4e-3, \
+        f"lm_head tail: rel_rms {rel_rms_t:.2e} rel_max {rel_max_t:.2e}"
