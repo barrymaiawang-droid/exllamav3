@@ -46,6 +46,7 @@ def test_run_probe_argv_sink(tmp_path):
     stub(venv / "python", argvlog)
     envscript = tmp_path / "env.sh"
     envscript.write_text("#!/usr/bin/env bash\ntrue\n")
+    (tmp_path / "probe_mtp_causal.py").write_text("")      # the entry exists; the stub python runs
     r = subprocess.run([str(exp / "run_probe.sh"), str(tmp_path / "probe.json"),
                         str(tmp_path / "tensors"), "18"],
                        env=env(exp, ENV_SCRIPT=str(envscript), VENV=str(tmp_path / "venv"),
@@ -59,6 +60,55 @@ def test_run_probe_argv_sink(tmp_path):
         assert flag in argv, argv
     assert "--max-new" not in argv
     assert argv[argv.index("--index") + 1] == "18"
+
+
+def test_run_probe_selects_the_runtime_binding(tmp_path):
+    """One harness, two runtimes: each mode binds its own env/venv/tree/cache, default stays rocm10."""
+    exp = sandbox(tmp_path)
+    argvlog = tmp_path / "argv.log"
+    envlog = tmp_path / "env.log"
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True)
+    stub(venv / "python", argvlog)
+    envscript = tmp_path / "env.sh"
+    # an env script that tries to impose its own FORK/cache: the mode binding must win
+    envscript.write_text(f'#!/usr/bin/env bash\nexport FORK=/should/be/overridden\n'
+                         f'export TORCH_EXTENSIONS_DIR=/should/be/overridden\n'
+                         f'printf "%s\\n" "$FORK" >> {envlog}\n')
+    entry = tmp_path / "probe_mtp_causal.py"
+    entry.write_text("")
+    for runtime, cache, fork in (("rocm10", "ext-cache-instr", "exl3-v164-rocm10-port"),
+                                 ("rocm713", "ext-cache-pristine", "exl3-v164-pristine")):
+        cdir = tmp_path / cache
+        cdir.mkdir(exist_ok=True)
+        fdir = tmp_path / fork
+        fdir.mkdir(exist_ok=True)
+        r = subprocess.run([str(exp / "run_probe.sh"), str(tmp_path / f"{runtime}.json"),
+                            str(tmp_path / f"{runtime}-t"), "18"],
+                           env=env(exp, X3_PROBE_RUNTIME=runtime, ENV_SCRIPT=str(envscript),
+                                   VENV=str(tmp_path / "venv"), FORK=str(fdir),
+                                   TORCH_EXTENSIONS_DIR=str(cdir), PROBE_ENTRY=str(entry)),
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, (runtime, r.stderr)
+        assert f"runtime={runtime}" in r.stderr, r.stderr
+        assert f"cache={cdir}" in r.stderr, r.stderr
+    # a mixed pairing is refused for both runtimes
+    bad_cache = tmp_path / "ext-cache-pristine"
+    bad_fork = tmp_path / "exl3-v164-rocm10-port"
+    bad_cache.mkdir(exist_ok=True)
+    bad_fork.mkdir(exist_ok=True)
+    r = subprocess.run([str(exp / "run_probe.sh"), str(tmp_path / "bad.json")],
+                       env=env(exp, X3_PROBE_RUNTIME="rocm10", ENV_SCRIPT=str(envscript),
+                               VENV=str(tmp_path / "venv"), FORK=str(bad_fork),
+                               TORCH_EXTENSIONS_DIR=str(bad_cache), PROBE_ENTRY=str(entry)),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 8 and "REFUSING cache/tree mismatch" in r.stderr
+    # unknown runtime is rejected
+    r = subprocess.run([str(exp / "run_probe.sh"), str(tmp_path / "x.json")],
+                       env=env(exp, X3_PROBE_RUNTIME="rocm9", VENV=str(tmp_path / "venv"),
+                               ENV_SCRIPT=str(envscript), PROBE_ENTRY=str(entry)),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 9
 
 
 def test_run_probe_refuses_cache_tree_mismatch(tmp_path):
