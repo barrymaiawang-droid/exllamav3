@@ -13,6 +13,7 @@
 #include "../add.cuh"
 #if defined(USE_ROCM)
     #include "../rocm/quant/exl3_gemv_multirow_rdna.cuh"
+    #include "../quant/exl3_dispatch_stats.cuh"
 #endif
 
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
@@ -86,7 +87,15 @@ void BC_BlockSparseMLP::run_bszN
     c10::cuda::CUDAGuard device_guard(y.device());
 
 #if defined(USE_ROCM)
-    if (rdna_moe && run_bszN_rdna(y, selected_experts, routing_weights)) return;
+    if (rdna_moe)
+    {
+        if (run_bszN_rdna(y, selected_experts, routing_weights))
+        {
+            exl3_dispatch_stats::bump(exl3_dispatch_stats::MOE_RDNA_DECODE);
+            return;
+        }
+        exl3_dispatch_stats::bump(exl3_dispatch_stats::MOE_KERNEL_FALLBACK);
+    }
 #endif
 
     // Shared experts run through their own multi-row graph first (same stream); the kernel adds

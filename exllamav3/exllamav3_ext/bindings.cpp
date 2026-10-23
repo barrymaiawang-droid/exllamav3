@@ -30,6 +30,7 @@
 #include "cpu/moe_mul1.h"
 #include "cpu/moe_handoff.h"
 #include "quant/exl3_kernel_map.cuh"
+#include "quant/exl3_dispatch_stats.cuh"
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include "quant/exl3_moe.cuh"
@@ -187,6 +188,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
     m.def("g_get_smem_max", &g_get_smem_max, "g_get_smem_max");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
+    m.def("exl3_dispatch_stats", []()
+    {
+        py::dict d;
+        for (auto& kv : exl3_dispatch_stats::snapshot()) d[py::str(kv.first)] = py::int_(kv.second);
+        return d;
+    }, "exl3_dispatch_stats (experiment build; EXL3_DISPATCH_STATS)");
+    m.def("exl3_dispatch_stats_reset", []() { exl3_dispatch_stats::reset(); }, "exl3_dispatch_stats_reset");
     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
     m.def("exl3_moe_cpu_forward", &exl3_moe_cpu_forward, "exl3_moe_cpu_forward",
