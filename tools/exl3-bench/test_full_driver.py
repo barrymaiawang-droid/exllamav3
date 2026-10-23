@@ -217,8 +217,23 @@ class FakeModel:
         self.loaded = True
         return self
 
+    def prefill(self, input_ids, params):
+        """Model.prefill: writes cache/state, advances recurrence, returns no logits."""
+        self.prefill_calls = getattr(self, "prefill_calls", 0) + 1
+        self._write(input_ids, params)
+        return None
+
     def forward(self, input_ids, params):
         seqlen = int(params["cache_seqlens"][0])
+        rows = int(input_ids.shape[1])
+        st = (params.get("recurrent_states") or [None])[0]
+        self._write(input_ids, params)
+        if params.get("last_tokens_only"):
+            return None                          # real API: MTP prefill returns no logits
+        return self._logits(seqlen, rows)
+
+    def _write(self, input_ids, params):
+        seqlen = int(params["cache_seqlens"].reshape(-1)[0])
         rows = int(input_ids.shape[1])
         st = (params.get("recurrent_states") or [None])[0]
         # write KV in the real paged layout for the rows this pass consumes
@@ -240,9 +255,6 @@ class FakeModel:
                 self.conv_corruptions.append((seqlen, rows, k_size))
         if st is not None:
             st.position = seqlen + rows
-        if params.get("last_tokens_only"):
-            return None                          # real API: prefill returns no logits
-        return self._logits(seqlen, rows)
 
     def rewind_to(self, st, seqlen):
         st.position = seqlen
@@ -309,7 +321,7 @@ class FakeGenerator:
         params = {"attn_mode": "flash_attn", "cache": self.cache,
                   "block_table": torch.tensor([list(range(used)) + [0] * (4 - used)], dtype=torch.int32),
                   "cache_seqlens": torch.tensor([seqlen], dtype=torch.int32),
-                  "positions": torch.tensor([[seqlen + i for i in range(len(rows))]], dtype=torch.int32),
+                  "positions": torch.tensor([seqlen], dtype=torch.int32),   # 1-D per-sequence offset
                   "recurrent_states": [self.state], "recurrent_history": history,
                   "last_tokens_only": last_only, "pinned_staging": True}
         return self.model.forward(torch.tensor([rows], dtype=torch.long), params)
@@ -317,8 +329,17 @@ class FakeGenerator:
     def iterate(self):
         if self.done:
             return []
-        # prefill: P-1 tokens, no logits (last_tokens_only)
-        self._call(PROMPT[:P - 1], 0, last_only=True)
+        # prefill: P-1 tokens. AR goes through Model.prefill; an MTP drafter forces
+        # Model.forward(last_tokens_only=1) (generator/job.py:1591-1595)
+        if self.num_draft:
+            self._call(PROMPT[:P - 1], 0, last_only=True)
+        else:
+            used = (P - 1 + PAGE - 1) // PAGE
+            self.model.prefill(torch.tensor([PROMPT[:P - 1]], dtype=torch.long),
+                               {"attn_mode": "flash_attn", "cache": self.cache,
+                                "block_table": torch.tensor([list(range(used))], dtype=torch.int32),
+                                "cache_seqlens": torch.tensor([0], dtype=torch.int32),
+                                "recurrent_states": [self.state], "pinned_staging": True})
         pending = PROMPT[-1]
         k = 0
         while len(self.generated) < self.job.max_new:
@@ -353,7 +374,13 @@ def install_fake_api(monkeypatch, target, draft):
     pkg.Config, pkg.Model, pkg.Cache = FakeConfig, FakeModel, FakeCache
     pkg.Tokenizer, pkg.Generator, pkg.Job = FakeTokenizer, FakeGenerator, FakeJob
     pkg.ext = types.ModuleType("exllamav3.ext")
-    pkg.ext.exllamav3_ext = types.SimpleNamespace(__file__="/fake/exllamav3_ext.so")
+    # a real (dummy) extension file, so the mandatory startup hashing is exercised unchanged
+    import tempfile
+    ext_dir = tempfile.mkdtemp(prefix="fake-ext-")
+    ext_path = os.path.join(ext_dir, "exllamav3_ext.so")
+    with open(ext_path, "wb") as f:
+        f.write(b"dummy extension bytes for identity hashing")
+    pkg.ext.exllamav3_ext = types.SimpleNamespace(__file__=ext_path)
     gen = types.ModuleType("exllamav3.generator")
     sampler = types.ModuleType("exllamav3.generator.sampler")
     sampler.ArgmaxSampler = lambda: "argmax"
@@ -376,7 +403,8 @@ def install_fake_api(monkeypatch, target, draft):
 
 # --------------------------------------------------------------------- driver fixture
 
-def run_driver(monkeypatch, gdn, fp16, out_path, corrupt=(), holder=None, corrupt_conv=False):
+def run_driver(monkeypatch, gdn, fp16, out_path, corrupt=(), holder=None, corrupt_conv=False,
+               fail_fast=None):
     target = FakeModel(target=True, corrupt=set(corrupt), corrupt_conv=corrupt_conv)
     if holder is not None:
         holder["target"] = target
@@ -395,6 +423,12 @@ def run_driver(monkeypatch, gdn, fp16, out_path, corrupt=(), holder=None, corrup
     args = types.SimpleNamespace(model="/fake/model", ctx=8192, index=18, filler=FILLER,
                                  prompt="Write a short paragraph about the ocean.",
                                  out=str(out_path), tensor_dir=str(out_path) + "-tensors")
+    if fail_fast is not None:
+        # the driver must keep a partial artifact when the run itself raises after wiring up
+        try:
+            raise fail_fast
+        finally:
+            pass
     rec = probe.run(args)
     return rec, caches, target
 
@@ -528,6 +562,89 @@ def test_conv_canonical_ignores_speculative_tail_and_detects_committed_change(gd
     ls2.conv_state[0, 0, 2] = 3.0             # inside the committed window
     c = snap(ls2)
     assert probe.compare_snapshots(a, c, "committed")["layers"]["('0', 0)"]["conv"]["max"] > 0
+
+
+def test_full_driver_prefill_entrypoint_matches_the_source_dispatch(monkeypatch, gdn, fp16, tmp_path):
+    """AR prefill must be recorded through Model.prefill, the MTP prefill through forward(last_tokens_only=1)."""
+    rec, caches, target = run_driver(monkeypatch, gdn, fp16, tmp_path / "probe.json")
+    ar_first = rec["gen_ar"]["first_callback"]
+    assert ar_first["method"] == "prefill", ar_first["method"]
+    ar_prefills = [c for c in rec["gen_ar"]["calls"] if c["method"] == "prefill"]
+    assert len(ar_prefills) == 1, f"gen_ar: expected exactly one prefill, got {len(ar_prefills)}"
+    assert ar_prefills[0]["rows"] == P - 1 and ar_prefills[0]["cache_seqlens"] == 0
+
+    mtp_first = rec["gen_mtp2"]["first_callback"]
+    assert mtp_first["method"] == "forward", mtp_first["method"]
+    mtp_prefills = [c for c in rec["gen_mtp2"]["calls"] if c["method"] == "prefill"]
+    assert mtp_prefills == [], "the MTP prefill must go through forward(last_tokens_only=1), not prefill"
+    mtp_prompt = [c for c in rec["gen_mtp2"]["calls"]
+                  if c["method"] == "forward" and c["extra_params"].get("last_tokens_only") == 1]
+    assert len(mtp_prompt) == 1, mtp_prompt
+    assert mtp_prompt[0]["rows"] == P - 1 and mtp_prompt[0]["cache_seqlens"] == 0
+    # the 1-D per-sequence offset is preserved end to end (rank 1, one entry per sequence)
+    for name in ("gen_ar", "gen_mtp2"):
+        positions = [c["positions"] for c in rec[name]["calls"] if c["positions"]]
+        assert positions, "no positions recorded"
+        assert all(len(p) == 1 for p in positions), positions[:3]
+
+
+def test_positions_adapter_rejects_a_token_grid():
+    """generator.py:1465 supplies a 1-D base offset; a 2-D grid must be a self-describing ParamError."""
+    rec = probe.ProbeRecorder(FakeModel(), P)
+    with pytest.raises(probe.ParamError) as e:
+        rec.capture("forward", rec.target_model, torch.tensor([[5]]),
+                    {"cache_seqlens": torch.tensor([P - 1], dtype=torch.int32),
+                     "block_table": torch.zeros((1, 2), dtype=torch.int32),
+                     "positions": torch.zeros((1, 3), dtype=torch.int32)},
+                    lambda: torch.zeros((1, 1, 8)))
+    assert "rank=2" in str(e.value) and "1-D" in str(e.value)
+
+
+def test_unexpected_exception_leaves_an_error_artifact(monkeypatch, gdn, fp16, tmp_path):
+    """main() must preserve a partial capture when run() raises, and still propagate the failure."""
+    out = tmp_path / "probe.json"
+    holder = {}
+    argv = ["probe_mtp_causal.py", "--model", "/fake/model", "--index", "18", "--out", str(out),
+            "--ctx", "8192", "--tensor-dir", str(out) + "-tensors", "--filler", str(FILLER)]
+    install_fake_api(monkeypatch, None, None)          # replaced below by the corrupting driver
+    with pytest.raises(Exception):
+        # build the models through run_driver's own path, but go through main() so the handler runs
+        import types as _t
+        target = FakeModel(target=True, corrupt_conv=True)
+        holder["target"] = target
+        draft = FakeModel(target=False)
+        pkg = install_fake_api(monkeypatch, target, draft)
+
+        class DriverCache(FakeCache):
+            def __init__(self, *a, **kw):
+                super().__init__(gdn, fp16)
+
+        pkg.Cache = DriverCache
+        monkeypatch.setattr(sys, "argv", argv)
+        probe.main(argv[1:])
+    art = str(out) + ".ERROR.json"
+    assert os.path.exists(art), "no error artifact was preserved"
+    data = json.load(open(art))
+    assert data["error"]["type"] in ("ProbeError", "SnapshotError", "SelectionError", "ContextError")
+    assert data["provenance"]["script"]["path"].endswith("probe_mtp_causal.py")
+    assert holder["target"].conv_corruptions, "the injected failure never fired"
+
+
+def test_source_conformance_prefill_dispatch_and_positions_rank():
+    job = os.path.join(SRC, "generator/job.py")
+    gen = os.path.join(SRC, "generator/generator.py")
+    if not (os.path.exists(job) and os.path.exists(gen)):
+        pytest.skip("upstream source not present")
+    jt, gt = open(job).read(), open(gen).read()
+    assert "if self.generator.mtp_draft:" in jt and "params[\"last_tokens_only\"] = 1" in jt
+    assert "self.generator.model.forward(input_ids = prefill_ids, params = params)" in jt
+    assert "self.generator.model.prefill(input_ids = prefill_ids, params = params)" in jt
+    assert 'positions = self._staging("positions", batch_size) if use_offsets else None' in gt
+    assert "positions[batch] = seq.kv_position + job.alt_rope_offset" in gt
+    model_src = open(os.path.join(SRC, "model/model.py")).read()
+    body = model_src[model_src.index("def prefill(self, input_ids"):]
+    assert "self.forward(" not in body[:body.index("def lm_head_argmax")] , \
+        "Model.prefill must not route through Model.forward"
 
 
 def test_control_gate_rejects_conv_only_mismatch(gdn):

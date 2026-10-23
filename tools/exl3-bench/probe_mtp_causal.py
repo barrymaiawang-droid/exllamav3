@@ -157,11 +157,12 @@ class CallRecord:
     """One recorded target forward: plain data plus the tensors needed for replay."""
 
     __slots__ = ("seq", "batch", "cols", "cache_seqlens", "block_row", "positions",
-                 "recurrent_history", "input_ids", "logits", "entry_state", "extra", "live_kv")
+                 "recurrent_history", "input_ids", "logits", "entry_state", "extra", "live_kv",
+                 "method")
 
     def __init__(self, seq, batch, cols, cache_seqlens, block_row, positions,
                  recurrent_history, input_ids, logits=None, entry_state=None, extra=None,
-                 live_kv=None):
+                 live_kv=None, method="forward"):
         self.seq = seq
         self.batch = batch
         self.cols = cols
@@ -174,6 +175,7 @@ class CallRecord:
         self.entry_state = entry_state
         self.extra = extra or {}          # primitive params replayed verbatim
         self.live_kv = live_kv            # KV prefix at the live frontier (entry of this call)
+        self.method = method              # "forward" | "prefill" (the real dispatch, replayed as such)
 
     @property
     def rows(self) -> int:
@@ -181,7 +183,7 @@ class CallRecord:
         return self.cols
 
     def summary(self) -> dict:
-        return {"seq": self.seq, "batch": self.batch, "rows": self.rows,
+        return {"seq": self.seq, "method": self.method, "batch": self.batch, "rows": self.rows,
                 "cache_seqlens": self.cache_seqlens, "positions": list(self.positions),
                 "recurrent_history": self.recurrent_history,
                 "input_ids": [list(r) for r in self.input_ids],
@@ -192,50 +194,98 @@ class CallRecord:
 
 
 class ProbeRecorder:
-    """Records target forwards only; draft forwards are counted and excluded.
+    """Records target forwards **and** target prefills, tagged by entrypoint.
 
-    `self is target_model` is the classifier: the MTP head is a different Model object, so its calls
-    can never be mistaken for target verification.
+    Source contract (v1.6.4): `Job.prefill` dispatches `Model.prefill(...)` for an ordinary AR job and
+    `Model.forward(..., last_tokens_only=1)` when an MTP drafter is attached (generator/job.py:1591-1595);
+    `Model.prefill` does not call `Model.forward` (model/model.py:368-389). A recorder that wraps only
+    `forward` therefore misses the AR prefill entirely, and its replay would start from an empty cache.
+
+    `self is target_model` classifies target vs draft: the MTP head is a different Model object, so its
+    calls can never be mistaken for target work and are only counted.
     """
 
     def __init__(self, target_model, prompt_len, capture_pred_indices=()):
         self.target_model = target_model
         self.prompt_len = prompt_len
-        self.capture = set(capture_pred_indices)
+        self.capture_indices = set(capture_pred_indices)
         self.calls = []
         self.draft_calls = 0
+        self.draft_prefills = 0
+        self.first_callback = None
         self._seq = 0
+        self._active = False          # guards against a nested hook being double counted
 
-    def __call__(self, model, input_ids, params, forward):
+    # --- parameter adapters: preserve the real rank/dtype, never guess -----------------------
+    @staticmethod
+    def _positions(params) -> list:
+        """`positions` is a 1-D per-sequence MRoPE *base offset* (generator.py:1457-1465), not a
+        [batch, token] grid, and prefill passes no positions at all."""
+        if "positions" not in params or params["positions"] is None:
+            return []
+        pos = params["positions"]
+        rank = getattr(pos, "dim", lambda: None)()
+        if rank != 1:
+            raise ParamError(
+                f"positions must be the 1-D per-sequence base offset, got type={type(pos).__name__} "
+                f"rank={rank} shape={tuple(getattr(pos, 'shape', ()))}")
+        return [int(x) for x in pos.tolist()]
+
+    @staticmethod
+    def _describe(value) -> dict:
+        if value is None:
+            return {"type": "NoneType", "rank": None, "shape": None}
+        shape = tuple(value.shape) if hasattr(value, "shape") else None
+        return {"type": type(value).__name__, "dtype": str(getattr(value, "dtype", None)),
+                "rank": len(shape) if shape is not None else None,
+                "shape": list(shape) if shape is not None else None,
+                "value_preview": (value.tolist()[:8] if hasattr(value, "tolist")
+                                  else repr(value)[:80])}
+
+    def capture(self, method, model, input_ids, params, invoke):
         is_target = model is self.target_model
         if not is_target:
-            self.draft_calls += 1
-            return forward()
+            if method == "prefill":
+                self.draft_prefills += 1
+            else:
+                self.draft_calls += 1
+            return invoke()
+        if self._active:
+            raise ProbeError("nested target capture: a hooked entrypoint re-entered another one")
         for key in ("cache_seqlens", "block_table"):
             if key not in params:
                 raise ParamError(
-                    f"target forward #{self._seq} has no {key!r}; the real generator supplies it "
-                    f"(generator/generator.py:1508-1523). Keys seen: {sorted(params)}")
+                    f"target {method} #{self._seq} has no {key!r}; the generator supplies it "
+                    f"(generator.py:1452-1465 for decode, job.py:1573-1582 for prefill). "
+                    f"Keys seen: {sorted(params)}")
         seqlens = params["cache_seqlens"]
-        if seqlens is None or len(seqlens) != 1:
-            raise ParamError(f"expected a single-sequence cache_seqlens, got {seqlens!r}")
-        cache_seqlen = int(seqlens[0])
+        if seqlens is None or int(getattr(seqlens, "numel", lambda: 0)()) != 1:
+            raise ParamError(f"expected one cache_seqlens entry, got {self._describe(seqlens)}")
+        cache_seqlen = int(seqlens.reshape(-1)[0])
         block = params["block_table"]
         if block is None or int(block.shape[0]) != 1:
-            raise ParamError(f"expected a single-row block_table, got {None if block is None else tuple(block.shape)}")
+            raise ParamError(f"expected a single-row block_table, got {self._describe(block)}")
         block_row = [int(x) for x in block[0].tolist()]
-        positions = params.get("positions")
-        positions = [int(x) for x in positions[0].tolist()] if positions is not None else []
+        positions = self._positions(params)
         hist = bool(params.get("recurrent_history"))
         states = params.get("recurrent_states") or []
         entry = snapshot_state(states[0]) if states else None
         preds = [predict_index(cache_seqlen, r, self.prompt_len) for r in range(int(input_ids.shape[1]))]
-        want = any(p in self.capture for p in preds)
-        want_logits = want
+        want = any(p in self.capture_indices for p in preds)
+        if self.first_callback is None:
+            self.first_callback = {
+                "method": method, "seq": self._seq,
+                "input_ids": self._describe(input_ids),
+                "cache_seqlens": self._describe(seqlens),
+                "positions": self._describe(params.get("positions")),
+                "block_table": self._describe(block),
+                "recurrent_history": hist,
+                "keys": sorted(params),
+            }
         extra = {}
         for key, value in params.items():
             if key in ("cache", "recurrent_states", "block_table", "cache_seqlens", "positions",
-                       "indexed_embeddings"):
+                       "indexed_embeddings", "inv_freq"):
                 continue
             if isinstance(value, (bool, int, float, str)) or value is None:
                 extra[key] = value
@@ -243,18 +293,17 @@ class ProbeRecorder:
                          cache_seqlens=cache_seqlen, block_row=block_row, positions=positions,
                          recurrent_history=hist,
                          input_ids=[[int(x) for x in row] for row in input_ids.tolist()],
-                         entry_state=entry, extra=extra,
-                         # the canonical KV prefix is hashed for every target call (a few tens of KB at
-                         # probe lengths); only the digest is retained, and the earlier common frontier
-                         # needs it as much as the selected pass does
+                         entry_state=entry, extra=extra, method=method,
                          live_kv=(kv_fingerprint(params["cache"], cache_seqlen, block_row)
                                   if states else None))
         self._seq += 1
-        out = forward()
-        if want_logits and isinstance(out, torch.Tensor):
-            rec.logits = out[0].detach().to(torch.float32).cpu().clone()   # (rows, vocab)
-        elif want_logits:
-            rec.extra["logits_returned"] = "none"      # prefill/last_tokens_only: no logits by design
+        self._active = True
+        try:
+            out = invoke()
+        finally:
+            self._active = False
+        if want and isinstance(out, torch.Tensor):
+            rec.logits = out[0].detach().to(torch.float32).cpu().clone()
         self.calls.append(rec)
         return out
 
@@ -262,7 +311,37 @@ class ProbeRecorder:
         return self.calls
 
 
+def hook_model(recorder, Model):
+    """Patch both real entrypoints; returns the originals so the caller can restore them."""
+    orig_forward, orig_prefill = Model.forward, Model.prefill
+
+    def forward(self, input_ids, params=None):
+        params = params or {}
+        return recorder.capture("forward", self, input_ids, params,
+                                lambda: orig_forward(self, input_ids, params))
+
+    def prefill(self, input_ids, params=None):
+        params = params or {}
+        return recorder.capture("prefill", self, input_ids, params,
+                                lambda: orig_prefill(self, input_ids, params))
+
+    Model.forward, Model.prefill = forward, prefill
+    return orig_forward, orig_prefill
+
+
+def unhook_model(Model, originals):
+    Model.forward, Model.prefill = originals
+
+
 # ----------------------------------------------------------------------------- state snapshots
+
+def _file_sha(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 def _infer_conv_kernel(conv: torch.Tensor) -> int:
     """Ring width (K + max_history) when the owning module is not reachable; the probe never guesses
@@ -479,8 +558,9 @@ def issue_control_rows(recorded_call, rows, cache, state, model):
     assert_identity_block(recorded_call)
     used = (recorded_call.cache_seqlens + len(rows) + PAGE_SIZE - 1) // PAGE_SIZE
     block = torch.tensor([list(range(used)) + [0] * (len(recorded_call.block_row) - used)], dtype=torch.int32)
-    positions = ([recorded_call.positions[0] + i for i in range(len(rows))]
-                 if recorded_call.positions else [])
+    # the control adds token ROWS, not position entries: positions stays the recorded 1-D
+    # per-sequence base offset (generator.py:1465)
+    positions = list(recorded_call.positions)
     params = {"attn_mode": "flash_attn", "cache": cache, "block_table": block,
               "cache_seqlens": torch.tensor([recorded_call.cache_seqlens], dtype=torch.int32),
               "recurrent_states": [state], "recurrent_history": False, "pinned_staging": True}
@@ -512,6 +592,55 @@ def write_json(rec: dict, path: str) -> None:
 
 # ----------------------------------------------------------------------------- driver
 
+def provenance_manifest(args) -> dict:
+    """Startup identity written before any allocation: sources, extension, script and the runtime
+    libraries this process will load. No credentials, no environment dump."""
+    import platform
+    import hashlib
+
+    def sha(path):
+        try:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except OSError:
+            return None
+
+    libs = []
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                path = line.split()[-1]
+                if any(k in path for k in ("libhsa", "libamdhip", "hipblas", "libtorch_hip",
+                                           "libamd_comgr", "librocm")):
+                    if path not in libs:
+                        libs.append(path)
+    except OSError:
+        pass
+    src_root = os.environ.get("FORK") or os.path.expanduser("~/exl3-v164-rocm10-port")
+    return {
+        "when": __import__("datetime").datetime.now().astimezone().isoformat(),
+        "host": platform.node(), "python": sys.version.split()[0], "argv": sys.argv,
+        "torch": torch.__version__, "torch_hip": torch.version.hip,
+        "script": {"path": os.path.realpath(__file__), "sha256": sha(os.path.realpath(__file__))},
+        "script_sha_note": "computed from this file at startup",
+        "source_root": src_root,
+        "source_head": _git_head(src_root),
+        "ext": None, "loaded_runtime_libs": libs, "model_dir": args.model,
+    }
+
+
+def _git_head(root):
+    import subprocess
+    try:
+        return subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True,
+                                       stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return None
+
+
 def run(args) -> dict:
     from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
     from exllamav3 import ext as exl_ext
@@ -525,6 +654,7 @@ def run(args) -> dict:
            "ext_file": os.path.realpath(exl_ext.exllamav3_ext.__file__),
            "index": args.index, "filler": args.filler}
 
+    rec["provenance"] = provenance_manifest(args)
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
     tok = Tokenizer.from_config(config)
@@ -539,6 +669,10 @@ def run(args) -> dict:
     if not all(getattr(c, "initialized", False) for c in caches.values()):
         raise ProbeError("a phase cache did not initialize")
     rec["caches"] = {k: id(c) for k, c in caches.items()}
+    # the loaded extension's identity is mandatory: a missing or unreadable file is a startup failure,
+    # not a value to paper over
+    ext_path = os.path.realpath(exl_ext.exllamav3_ext.__file__)
+    rec["provenance"]["ext"] = {"path": ext_path, "sha256": _file_sha(ext_path)}
 
     ids = tok.encode(args.prompt, encode_special_tokens=True)
     prompt_ids = [int(x) for x in ids[0].tolist()]
@@ -549,14 +683,9 @@ def run(args) -> dict:
         "prefill_consumes": P - 1,
         "source": "generator/job.py:1417 prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)"}
 
-    orig_forward = Model.forward
-
     def run_generator(name, num_draft, target_cache, max_new):
         recorder = ProbeRecorder(model, P, capture_pred_indices=(args.index,))
-        def wrapper(self, input_ids, params=None):
-            params = params or {}
-            return recorder(self, input_ids, params, lambda: orig_forward(self, input_ids, params))
-        Model.forward = wrapper
+        originals = hook_model(recorder, Model)
         try:
             kw = ({"draft_model": draft, "draft_cache": draft_cache,
                    "num_draft_tokens": num_draft, "record_draft_stats": True} if num_draft else {})
@@ -577,7 +706,7 @@ def run(args) -> dict:
             generated = [int(x) for x in seq[0, P:].tolist()]
             return recorder, generated, [list(map(int, x)) for x in (getattr(job, "draft_stats", []) or [])]
         finally:
-            Model.forward = orig_forward
+            unhook_model(Model, originals)
 
     runs = {}
     for name, nd in (("gen_ar", 0), ("gen_mtp2", 2)):
@@ -595,6 +724,7 @@ def run(args) -> dict:
                       "logits": call.logits[row], "records": calls,
                       "n_target_calls": len(calls), "n_draft_calls": recorder.draft_calls}
         rec[name] = {"generated_ids": generated, "draft_stats": dstats,
+                     "first_callback": recorder.first_callback,
                      "selected": {"seq": call.seq, "row": row, "cache_seqlens": call.cache_seqlens,
                                   "rows": call.rows, "history": call.recurrent_history,
                                   "predicted_index": predict_index(call.cache_seqlens, row, P),
@@ -768,23 +898,52 @@ def run(args) -> dict:
     return rec
 
 
-def replay_one(call, cache, state, model):
-    """Replay one recorded target call: recorded ids, cache_seqlens, positions, history, primitives."""
-    assert_identity_block(call)
-    used = (call.cache_seqlens + call.rows + PAGE_SIZE - 1) // PAGE_SIZE
-    block = torch.tensor([list(range(used)) + [0] * (len(call.block_row) - used)], dtype=torch.int32)
+def _replay_params(call, cache, state, block):
     params = {"attn_mode": "flash_attn", "cache": cache, "block_table": block,
               "cache_seqlens": torch.tensor([call.cache_seqlens], dtype=torch.int32),
               "recurrent_states": [state], "recurrent_history": call.recurrent_history,
               "pinned_staging": True}
     if call.positions:
-        params["positions"] = torch.tensor([call.positions], dtype=torch.int32)
+        # 1-D per-sequence MRoPE base offset, exactly as recorded: never expanded into a token grid
+        params["positions"] = torch.tensor(list(call.positions), dtype=torch.int32)
     for key, value in (call.extra or {}).items():
-        params.setdefault(key, value)      # e.g. last_tokens_only / skip_logits, replayed verbatim
-    out = model.forward(torch.tensor(call.input_ids, dtype=torch.long), params)
+        params.setdefault(key, value)      # e.g. last_tokens_only, replayed verbatim
+    return params
+
+
+def replay_one(call, cache, state, model):
+    """Replay one recorded target call through the same entrypoint the generator used."""
+    assert_identity_block(call)
+    used = (call.cache_seqlens + call.rows + PAGE_SIZE - 1) // PAGE_SIZE
+    block = torch.tensor([list(range(used)) + [0] * (len(call.block_row) - used)], dtype=torch.int32)
+    params = _replay_params(call, cache, state, block)
+    ids = torch.tensor(call.input_ids, dtype=torch.long)
+    if call.method == "prefill":
+        out = model.prefill(ids, params)     # Model.prefill does not call forward (model.py:368-389)
+    elif call.method == "forward":
+        out = model.forward(ids, params)
+    else:
+        raise ProbeError(f"unknown recorded entrypoint {call.method!r}")
     if out is None:
-        return None                      # prefill / last_tokens_only: the real API returns no logits
+        return None
     return out[0].detach().to(torch.float32).cpu()
+
+
+def _write_error_artifact(args, exc, extra=None):
+    """Preserve a partial capture on any unexpected exception; never swallow, never retry."""
+    import traceback
+    if not getattr(args, "out", None):
+        return
+    payload = {"label": "mtp-causal-probe-v4-ERROR", "argv": sys.argv,
+               "error": {"type": type(exc).__name__, "message": str(exc),
+                         "traceback": traceback.format_exc()},
+               "provenance": provenance_manifest(args)}
+    payload.update(extra or {})
+    try:
+        with open(args.out + ".ERROR.json", "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+    except Exception as write_exc:          # the artifact write must not mask the original failure
+        print(f"could not write {args.out}.ERROR.json: {write_exc}", file=sys.stderr)
 
 
 def main(argv=None) -> int:
@@ -803,7 +962,11 @@ def main(argv=None) -> int:
         print(json.dumps({"dry_check": "ok", "index": args.index, "filler": args.filler,
                           "argv": sys.argv, "note": "no model, no cache, no device touched"}))
         return 0
-    rec = run(args)
+    try:
+        rec = run(args)
+    except BaseException as exc:            # includes ProbeError and any contract violation
+        _write_error_artifact(args, exc)
+        raise
     if args.out:
         write_json(rec, args.out)
     print(json.dumps(rec, indent=2, default=str))

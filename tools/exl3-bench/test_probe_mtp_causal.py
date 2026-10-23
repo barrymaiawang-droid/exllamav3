@@ -172,17 +172,17 @@ def test_target_call_without_cache_seqlens_is_a_param_error():
     model, target = FakeModel(), FakeModel()
     rec = probe.ProbeRecorder(target, P)
     with pytest.raises(probe.ParamError):
-        rec(model=target, input_ids=torch.tensor([[5]]),
+        rec.capture("forward", target, input_ids=torch.tensor([[5]]),
             params={"past_len": P + 18, "block_table": torch.zeros((1, 2), dtype=torch.int32)},
-            forward=lambda: torch.zeros((1, 1, 8)))
+            invoke=lambda: torch.zeros((1, 1, 8)))
 
 
 def test_target_call_without_block_table_is_a_param_error():
     rec = probe.ProbeRecorder(FakeModel(), P)
     with pytest.raises(probe.ParamError):
-        rec(model=rec.target_model, input_ids=torch.tensor([[5]]),
+        rec.capture("forward", rec.target_model, input_ids=torch.tensor([[5]]),
             params={"cache_seqlens": torch.tensor([P], dtype=torch.int32)},
-            forward=lambda: torch.zeros((1, 1, 8)))
+            invoke=lambda: torch.zeros((1, 1, 8)))
 
 
 # --------------------------------------------------------------------------- 4. drafts vs accepted rows
@@ -207,14 +207,14 @@ def test_ledger_error_mentions_the_position():
 def test_draft_model_calls_are_excluded_from_selection():
     target, draft_model = FakeModel(), FakeModel()
     rec = probe.ProbeRecorder(target, P, capture_pred_indices=(18,))
-    rec(model=target, input_ids=torch.tensor([[PROMPT[-1]]]),
+    rec.capture("forward", target, input_ids=torch.tensor([[PROMPT[-1]]]),
         params={"cache_seqlens": torch.tensor([P - 1], dtype=torch.int32),
                 "block_table": torch.zeros((1, 2), dtype=torch.int32)},
-        forward=lambda: torch.zeros((1, 1, 8)))
-    rec(model=draft_model, input_ids=torch.tensor([[7, 8]]),
+        invoke=lambda: torch.zeros((1, 1, 8)))
+    rec.capture("forward", draft_model, input_ids=torch.tensor([[7, 8]]),
         params={"cache_seqlens": torch.tensor([P], dtype=torch.int32),
                 "block_table": torch.zeros((1, 2), dtype=torch.int32)},
-        forward=lambda: torch.zeros((1, 2, 8)))
+        invoke=lambda: torch.zeros((1, 2, 8)))
     assert len(rec.target_calls()) == 1 and rec.draft_calls == 1
     assert all(c.batch == 1 for c in rec.target_calls())
     assert probe.predict_index(rec.target_calls()[0].cache_seqlens, 0, P) == 0
