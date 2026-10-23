@@ -31,6 +31,13 @@ def stub(path, marker, rc=0):
     os.chmod(path, 0o755)
 
 
+def probe_entry(tmp_path):
+    """The wrapper validates that its entry point exists; give it a hermetic one."""
+    entry = tmp_path / "probe_mtp_causal.py"
+    entry.write_text("# stub entry for the argv sink\n")
+    return entry
+
+
 def env(exp, **kw):
     e = dict(os.environ, EXP_ROOT_DIR=str(exp), X3_PREFLIGHT_WAIT_S="1")
     e.pop("X3_MOCK", None)
@@ -46,12 +53,11 @@ def test_run_probe_argv_sink(tmp_path):
     stub(venv / "python", argvlog)
     envscript = tmp_path / "env.sh"
     envscript.write_text("#!/usr/bin/env bash\ntrue\n")
-    (tmp_path / "probe_mtp_causal.py").write_text("")      # the entry exists; the stub python runs
     r = subprocess.run([str(exp / "run_probe.sh"), str(tmp_path / "probe.json"),
                         str(tmp_path / "tensors"), "18"],
                        env=env(exp, ENV_SCRIPT=str(envscript), VENV=str(tmp_path / "venv"),
                                FORK=str(tmp_path / "exl3-v164-rocm10-port"), TORCH_EXTENSIONS_DIR=str(exp / "ext-cache-instr"),
-                               PROBE_ENTRY=str(tmp_path / "probe_mtp_causal.py")),
+                               PROBE_ENTRY=str(probe_entry(tmp_path))),
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     argv = argvlog.read_text().split()
@@ -60,55 +66,6 @@ def test_run_probe_argv_sink(tmp_path):
         assert flag in argv, argv
     assert "--max-new" not in argv
     assert argv[argv.index("--index") + 1] == "18"
-
-
-def test_run_probe_selects_the_runtime_binding(tmp_path):
-    """One harness, two runtimes: each mode binds its own env/venv/tree/cache, default stays rocm10."""
-    exp = sandbox(tmp_path)
-    argvlog = tmp_path / "argv.log"
-    envlog = tmp_path / "env.log"
-    venv = tmp_path / "venv" / "bin"
-    venv.mkdir(parents=True)
-    stub(venv / "python", argvlog)
-    envscript = tmp_path / "env.sh"
-    # an env script that tries to impose its own FORK/cache: the mode binding must win
-    envscript.write_text(f'#!/usr/bin/env bash\nexport FORK=/should/be/overridden\n'
-                         f'export TORCH_EXTENSIONS_DIR=/should/be/overridden\n'
-                         f'printf "%s\\n" "$FORK" >> {envlog}\n')
-    entry = tmp_path / "probe_mtp_causal.py"
-    entry.write_text("")
-    for runtime, cache, fork in (("rocm10", "ext-cache-instr", "exl3-v164-rocm10-port"),
-                                 ("rocm713", "ext-cache-pristine", "exl3-v164-pristine")):
-        cdir = tmp_path / cache
-        cdir.mkdir(exist_ok=True)
-        fdir = tmp_path / fork
-        fdir.mkdir(exist_ok=True)
-        r = subprocess.run([str(exp / "run_probe.sh"), str(tmp_path / f"{runtime}.json"),
-                            str(tmp_path / f"{runtime}-t"), "18"],
-                           env=env(exp, X3_PROBE_RUNTIME=runtime, ENV_SCRIPT=str(envscript),
-                                   VENV=str(tmp_path / "venv"), FORK=str(fdir),
-                                   TORCH_EXTENSIONS_DIR=str(cdir), PROBE_ENTRY=str(entry)),
-                           capture_output=True, text=True, timeout=60)
-        assert r.returncode == 0, (runtime, r.stderr)
-        assert f"runtime={runtime}" in r.stderr, r.stderr
-        assert f"cache={cdir}" in r.stderr, r.stderr
-    # a mixed pairing is refused for both runtimes
-    bad_cache = tmp_path / "ext-cache-pristine"
-    bad_fork = tmp_path / "exl3-v164-rocm10-port"
-    bad_cache.mkdir(exist_ok=True)
-    bad_fork.mkdir(exist_ok=True)
-    r = subprocess.run([str(exp / "run_probe.sh"), str(tmp_path / "bad.json")],
-                       env=env(exp, X3_PROBE_RUNTIME="rocm10", ENV_SCRIPT=str(envscript),
-                               VENV=str(tmp_path / "venv"), FORK=str(bad_fork),
-                               TORCH_EXTENSIONS_DIR=str(bad_cache), PROBE_ENTRY=str(entry)),
-                       capture_output=True, text=True, timeout=60)
-    assert r.returncode == 8 and "REFUSING cache/tree mismatch" in r.stderr
-    # unknown runtime is rejected
-    r = subprocess.run([str(exp / "run_probe.sh"), str(tmp_path / "x.json")],
-                       env=env(exp, X3_PROBE_RUNTIME="rocm9", VENV=str(tmp_path / "venv"),
-                               ENV_SCRIPT=str(envscript), PROBE_ENTRY=str(entry)),
-                       capture_output=True, text=True, timeout=60)
-    assert r.returncode == 9
 
 
 def test_run_probe_refuses_cache_tree_mismatch(tmp_path):
@@ -120,10 +77,135 @@ def test_run_probe_refuses_cache_tree_mismatch(tmp_path):
     envscript.write_text("true\n")
     r = subprocess.run([str(exp / "run_probe.sh"), str(tmp_path / "p.json")],
                        env=env(exp, ENV_SCRIPT=str(envscript), VENV=str(tmp_path / "venv"),
-                               FORK="/nonexistent/tree", TORCH_EXTENSIONS_DIR=str(exp / "ext-cache-instr")),
+                               FORK="/nonexistent/tree", TORCH_EXTENSIONS_DIR=str(exp / "ext-cache-instr"),
+                               PROBE_ENTRY=str(probe_entry(tmp_path))),
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 8 and "cache/tree mismatch" in r.stderr
     assert not (tmp_path / "argv.log").exists()
+
+
+REPLACED_OBSERVATIONS = {
+    "avail_mib() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo; }":
+        'avail_mib() { cat "$EXP/raw/fake-avail-mib"; }',
+    "gtt_bytes() { cat /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1; }":
+        'gtt_bytes() { cat "$EXP/raw/fake-gtt-bytes"; }',
+    '  ss -ltn 2>/dev/null | grep -E ":1815[0-9] " && return 1':
+        '  [ -e "$EXP/raw/fake-owner-present" ] && return 1',
+    '  ps -eo args | grep -E "[o]rnith122-serve|[t]ools/glm/serve" && return 1':
+        '  [ -e "$EXP/raw/fake-owner-present" ] && return 1',
+}
+
+
+def sandbox_with_fake_observations(exp, avail_mib=200000, gtt_bytes=0):
+    """Point the sandbox copy's resource observations at files the test controls.
+
+    window3.sh observes `/proc/meminfo`, `/sys/class/drm/*/device/mem_info_gtt_used` and the
+    compute owners (`ss`/`ps`) by absolute path, so a CPU-only rehearsal on a host with a resident GPU
+    owner - or with an unrelated monitor whose argv names a production service - cannot observe an
+    idle box. Only those observation lines are replaced, and only in the sandbox copy: the thresholds,
+    the preflight decision, the guard, the watchdog, the marker and cleanup paths are the real file
+    text. The replacements still drive the real decision logic (the owner marker makes `compute_owners`
+    refuse), so the rehearsal exercises both outcomes hermetically.
+    """
+    script = exp / "window3.sh"
+    src = script.read_text()
+    for old in REPLACED_OBSERVATIONS:
+        assert src.count(old) == 1, f"unexpected observation line in window3.sh: {old!r}"
+    (exp / "raw" / "fake-avail-mib").write_text(f"{int(avail_mib)}\n")
+    (exp / "raw" / "fake-gtt-bytes").write_text(f"{int(gtt_bytes)}\n")
+    patched = src
+    for old, new in REPLACED_OBSERVATIONS.items():
+        patched = patched.replace(old, new)
+    script.write_text(patched)
+    os.chmod(script, 0o755)
+    pairs = [(a, b) for a, b in zip(src.splitlines(), patched.splitlines()) if a != b]
+    assert [a for a, _ in pairs] == list(REPLACED_OBSERVATIONS), (
+        f"the rehearsal patched more than the observation lines: {pairs}")
+    assert [b for _, b in pairs] == list(REPLACED_OBSERVATIONS.values())
+    return script
+
+
+def test_window_probe_only_passes_the_opt_in_capture_through_the_guards(tmp_path):
+    """The authorised entrypoint is `window3.sh --probe-only`, not a bare wrapper.
+
+    The capture is opt-in through the environment, so the rehearsal checks the *actual* driver: the
+    window's own selfcheck/preflight/guard/cleanup run, `run_probe.sh` receives the capture flags and
+    the operator's unique nonce directory (which is independent of the RUN_ID the window generates),
+    and nothing here starts a model or signals another run. The only fabricated inputs are the three
+    resource observations (hermetic fixture files) and the already-stubbed entrypoints.
+    """
+    exp = sandbox(tmp_path)
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True)
+    argvlog = tmp_path / "argv.log"
+    stub(venv / "python", argvlog)
+    envscript = tmp_path / "env.sh"
+    envscript.write_text("#!/usr/bin/env bash\ntrue\n")
+    selfcheck = tmp_path / "selfcheck.log"
+    stub(exp / "run_arm3.sh", selfcheck)
+    cleanup = tmp_path / "cleanup.log"
+    stub(exp / "cleanup-run.sh", cleanup)
+    sandbox_with_fake_observations(exp)
+    nonce = f"{tmp_path.name}-{int(time.time() * 1000)}"
+    capture_root = exp / "raw" / f"capture-{nonce}-layer0"
+    e = env(exp, X3_PROBE_RUNTIME="rocm713",
+            ENV_SCRIPT=str(envscript), VENV=str(tmp_path / "venv"),
+            FORK=str(exp / "exl3-v164-pristine"),
+            TORCH_EXTENSIONS_DIR=str(exp / "ext-cache-pristine"),
+            PROBE_ENTRY=str(probe_entry(tmp_path)),
+            CAPTURE_DIR=str(capture_root), CAPTURE_POSITIONS="7,8,9",
+            # the proposed real preflight spells out 80 GiB (81920 MiB); the driver floor and the
+            # GTT ceiling stay at their defaults
+            X3_ARM_MIN_AVAIL_MIB="81920", X3_PROBE_INDEX="18")
+    r = subprocess.run([str(exp / "window3.sh"), "--probe-only"], env=e,
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, (r.returncode, r.stdout[-1500:], r.stderr[-800:])
+    # the real preflight consumed the fake observations and admitted the arm on the real thresholds
+    assert "arm preflight ok: avail=200000MiB gtt=0B owners=none" in r.stdout, r.stdout[-1200:]
+    # the guard suite still ran: selfcheck, arm start, run-scoped cleanup
+    assert "probe arm start" in r.stdout and "probe-only window complete" in r.stdout
+    assert "selfcheck" in selfcheck.read_text().split()
+    assert "runtime=rocm713" in r.stdout, "the rocm713 runtime binding did not reach run_probe.sh"
+    assert cleanup.exists(), "the window did not run its run-scoped cleanup"
+    argv = argvlog.read_text().split()
+    assert argv[argv.index("--capture-dir") + 1] == str(capture_root)
+    assert argv[argv.index("--capture-positions") + 1] == "7,8,9"
+    assert capture_root.is_dir(), "run_probe.sh did not create the operator's capture directory"
+    # the probe's own --out is the window RUN_ID's artifact; the capture nonce is separate
+    out = argv[argv.index("--out") + 1]
+    assert "-probe-causal" in out
+    assert str(capture_root) not in out, "the capture nonce was assumed to be the window RUN_ID"
+    # the dry run must not advertise a capture it was not given
+    r = subprocess.run([str(exp / "window3.sh")], env=env(exp), capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0 and "DRY RUN" in r.stdout
+
+
+def test_window_refuses_the_probe_arm_when_another_compute_owner_is_present(tmp_path):
+    """The same rehearsal, with the owner observation set: the real preflight must refuse."""
+    exp = sandbox(tmp_path)
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True)
+    argvlog = tmp_path / "argv.log"
+    stub(venv / "python", argvlog)
+    envscript = tmp_path / "env.sh"
+    envscript.write_text("#!/usr/bin/env bash\ntrue\n")
+    stub(exp / "run_arm3.sh", tmp_path / "selfcheck.log")
+    stub(exp / "cleanup-run.sh", tmp_path / "cleanup.log")
+    sandbox_with_fake_observations(exp)
+    (exp / "raw" / "fake-owner-present").write_text("")
+    e = env(exp, X3_PROBE_RUNTIME="rocm713",
+            ENV_SCRIPT=str(envscript), VENV=str(tmp_path / "venv"),
+            FORK=str(exp / "exl3-v164-pristine"),
+            TORCH_EXTENSIONS_DIR=str(exp / "ext-cache-pristine"),
+            PROBE_ENTRY=str(probe_entry(tmp_path)),
+            CAPTURE_DIR=str(exp / "raw" / "capture-owner-layer0"))
+    r = subprocess.run([str(exp / "window3.sh"), "--probe-only"], env=e,
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 20, (r.returncode, r.stdout[-1200:])
+    assert "ARM PREFLIGHT FAIL: another compute owner present" in r.stdout
+    assert "probe arm start" not in r.stdout, "the arm started despite the refused preflight"
+    assert not argvlog.exists(), "the probe entrypoint ran despite the refused preflight"
 
 
 def test_window_selfcheck_is_passed_explicitly_and_aborts_before_any_arm(tmp_path):

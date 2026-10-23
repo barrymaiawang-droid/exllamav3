@@ -33,6 +33,9 @@ VENV=${VENV:-$DEFAULT_VENV}
 FORK=${FORK:-$DEFAULT_FORK}
 CACHE=${TORCH_EXTENSIONS_DIR:-$DEFAULT_CACHE}
 ENTRY=${PROBE_ENTRY:-$HOME/x3-exp/rocm10/probe_mtp_causal.py}
+# Opt-in layer-0 capture (diagnostic): unset changes nothing about the reviewed argv.
+CAPTURE_DIR=${CAPTURE_DIR:-}
+CAPTURE_POSITIONS=${CAPTURE_POSITIONS:-7,8,9}
 
 for f in "$ENV_SCRIPT" "$VENV/bin/python" "$ENTRY"; do
   [ -e "$f" ] || { echo "run_probe[$RUNTIME]: missing $f" >&2; exit 7; }
@@ -59,10 +62,16 @@ if [ "$ok" != 1 ]; then
 fi
 
 mkdir -p "$TDIR"
-echo "run_probe: runtime=$RUNTIME venv=$VENV fork=$FORK cache=$TORCH_EXTENSIONS_DIR" >&2
+CAPTURE_ARGS=()
+if [ -n "$CAPTURE_DIR" ]; then
+  mkdir -p "$CAPTURE_DIR"
+  CAPTURE_ARGS=(--capture-dir "$CAPTURE_DIR" --capture-positions "$CAPTURE_POSITIONS")
+fi
+echo "run_probe: runtime=$RUNTIME venv=$VENV fork=$FORK cache=$TORCH_EXTENSIONS_DIR capture=${CAPTURE_DIR:-none}" >&2
 exec "$VENV/bin/python" "$ENTRY" \
   --ctx 8192 \
   --index "$IDX" \
   --prompt "Write a short paragraph about the ocean." \
   --out "$OUT" \
-  --tensor-dir "$TDIR"
+  --tensor-dir "$TDIR" \
+  "${CAPTURE_ARGS[@]}"

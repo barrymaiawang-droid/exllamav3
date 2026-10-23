@@ -434,7 +434,7 @@ def install_fake_api(monkeypatch, target, draft):
 # --------------------------------------------------------------------- driver fixture
 
 def run_driver(monkeypatch, gdn, fp16, out_path, corrupt=(), holder=None, corrupt_conv=False,
-               fail_fast=None, inference_tensors=False):
+               fail_fast=None, inference_tensors=False, capture_dir=None, capture_positions=None):
     target = FakeModel(target=True, corrupt=set(corrupt), corrupt_conv=corrupt_conv)
     if holder is not None:
         holder["target"] = target
@@ -453,6 +453,12 @@ def run_driver(monkeypatch, gdn, fp16, out_path, corrupt=(), holder=None, corrup
     args = types.SimpleNamespace(model="/fake/model", ctx=8192, index=18, filler=FILLER,
                                  prompt="Write a short paragraph about the ocean.",
                                  out=str(out_path), tensor_dir=str(out_path) + "-tensors")
+    if capture_dir is not None:
+        args.capture_dir = str(capture_dir)
+        args.capture_positions = capture_positions or "7,8,9"
+        args.capture_layer = 0
+        args.capture_device = "cuda:0"
+        args.capture_device_index = None
     if fail_fast is not None:
         # the driver must keep a partial artifact when the run itself raises after wiring up
         try:
@@ -502,6 +508,69 @@ def test_full_driver_executes_end_to_end(monkeypatch, gdn, fp16, tmp_path):
     assert os.path.isdir(tdir)
     for name in ("probe-logits.pt", "probe-kv.pt"):
         assert os.path.exists(os.path.join(tdir, name)), name
+
+
+def _fake_gdn_module():
+    """A GDN module whose three patchable seams exist but are never called by the fake model.
+
+    The capture only needs the seam signatures and the module globals `install()` reads, so a
+    capture can be installed and then fail completeness without a real layer running.
+    """
+    mod = types.ModuleType("exllamav3.modules.gated_delta_net")
+    ns = mod.__dict__
+    exec(compile(
+        "def forward(self, x, params, out_dtype=None):\n"
+        "    raise AssertionError('the fake driver does not run the real layer')\n"
+        "class GatedDeltaNet:\n"
+        "    pass\n"
+        "GatedDeltaNet.forward = forward\n"
+        "class GDNState:\n"
+        "    def rewind(self, num_tokens):\n"
+        "        return None\n"
+        "class GDNLayerState:\n"
+        "    def replay_job(self, spec_row, prefix, spec_shape, base_row, scratch_row):\n"
+        "        return None\n", "<fake-gdn>", "exec"), ns)
+    ns["g_tensor_cache"] = types.SimpleNamespace()      # resolved by install(); never used here
+    ns["_BC_MAX_BSZ"] = 8
+    ns["_BC_MAX_QLEN"] = 16
+    return mod
+
+
+def test_capture_completeness_failure_keeps_flushed_evidence_and_restores_hooks(
+        monkeypatch, gdn, fp16, tmp_path):
+    """A diagnostic capture failure must not discard a completed generator's evidence.
+
+    The capture is installed on never-called seams, so it records nothing and its completeness check
+    fails. The already-flushed ids/logits/state evidence must survive, the partial capture must be
+    retained, and every patched seam must be restored.
+    """
+    fake = _fake_gdn_module()
+    pkg = types.ModuleType("exllamav3.modules")
+    pkg.__path__ = []
+    monkeypatch.setitem(sys.modules, "exllamav3.modules", pkg)
+    monkeypatch.setitem(sys.modules, "exllamav3.modules.gated_delta_net", fake)
+    spec = importlib.util.spec_from_file_location("capture_layer0",
+                                                 os.path.join(HERE, "capture_layer0.py"))
+    capture_layer0 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(capture_layer0)
+    monkeypatch.setitem(sys.modules, "capture_layer0", capture_layer0)
+    orig = (fake.GatedDeltaNet.forward, fake.GDNState.rewind, fake.GDNLayerState.replay_job)
+    out = tmp_path / "probe.json"
+    capdir = tmp_path / "capture"
+    with pytest.raises(capture_layer0.CaptureError) as exc:
+        run_driver(monkeypatch, gdn, fp16, out, capture_dir=capdir, capture_positions="7,8,9")
+    assert "incomplete" in str(exc.value) and "0 decode passes" in str(exc.value)
+    # the completed generator was flushed BEFORE the capture failure escaped
+    flushed = json.loads(open(str(out) + ".gen_ar.json").read())
+    assert flushed["generated_ids"] and len(flushed["generated_ids"]) >= 18
+    assert flushed["logits"]["sha256"] and flushed["selected"]["seq"] is not None
+    assert os.path.isdir(str(out) + "-tensors")
+    # the partial capture artifact survives with its own (empty, error-free) record set
+    doc = json.loads((capdir / "ar" / "gen_ar-layer0.json").read_text())
+    assert doc["records"] == [] and doc["errors"] == []
+    # every seam the capture patched is restored
+    assert (fake.GatedDeltaNet.forward, fake.GDNState.rewind,
+            fake.GDNLayerState.replay_job) == orig
 
 
 def test_false_replay_selfcheck_fails_nonzero_and_keeps_artifacts(monkeypatch, gdn, fp16, tmp_path):

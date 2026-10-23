@@ -697,6 +697,55 @@ def _git_head(root):
         return None
 
 
+def layer0_gate(args, captures, ext, replay_module=None) -> dict:
+    """Replay the captured transition through the native scan kernel and enforce the exact gate.
+
+    The gate is the whole point of the capture: `ext.batched_scan_replay`, fed the operands the
+    verifier actually consumed and the state it actually started from, must reproduce the captured
+    post-rewind row bit for bit. If it does not, the difference is in the inputs or in the fast path
+    that produced the recorded state - never a rounding result. A failing gate raises `ProbeError`
+    after the report is written, so the partial evidence survives the failure.
+    """
+    if replay_module is None:
+        import replay_fixture as replay_module
+    ar_doc = replay_module.load_capture(captures["gen_ar"]["info"]["json"])
+    mtp_doc = replay_module.load_capture(captures["gen_mtp2"]["info"]["json"])
+    report = replay_module.replay(ar_doc, mtp_doc, ext=ext, device=args.capture_device,
+                                  device_index=args.capture_device_index)
+    path = os.path.join(args.capture_dir, "layer0-replay.json")
+    write_json(report, path)
+    if not report["native_evidence"]:
+        raise ProbeError(
+            f"layer-0 replay ran on {report['device']}, which is not native numeric evidence; the "
+            f"capture must be replayed through the compiled scan kernel on the accelerator "
+            f"(report: {path})")
+    prerequisites = report.get("prerequisites") or {}
+    if prerequisites and not prerequisites.get("ok", True):
+        if getattr(args, "out", None):
+            write_json(report, args.out + ".LAYER0-GATE-FAILED.json")
+        raise ProbeError(
+            "layer-0 capture prerequisites failed (" + ", ".join(prerequisites.get("failed", [])) +
+            "): the AR and MTP paths did not start from the same state or consumed different operands, "
+            f"so no causal comparison is valid; nothing was compared (report: {path})")
+    if not report["gate"]["passed"]:
+        if getattr(args, "out", None):
+            write_json(report, args.out + ".LAYER0-GATE-FAILED.json")
+        raise ProbeError(
+            "layer-0 capture gate failed: native replay of the captured verifier operands does not "
+            "reproduce the captured post-rewind state. Inspect the captured operands and the fast "
+            f"path that produced them (report: {path}); this is not a rounding result.")
+    return {"path": path, "status": report["status"],
+            "native_evidence": report["native_evidence"], "ledger": report["ledger"],
+            "checks": report["checks"], "prerequisites": report.get("prerequisites"),
+            "gate": report["gate"],
+            "mtp_native_vs_ar_actual": report["mtp_native_vs_ar_actual"],
+            "operands_mtp_vs_ar": report["operands_mtp_vs_ar"],
+            "ar_native_steps": report["ar_native_steps"], "ar_replay": report.get("ar_replay"),
+            "chain": report.get("chain"),
+            "reference": report["reference"], "rounding": report["rounding"],
+            "ext": report.get("ext"), "source_device": report.get("source_device")}
+
+
 def run(args) -> dict:
     from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
     from exllamav3 import ext as exl_ext
@@ -711,6 +760,19 @@ def run(args) -> dict:
            "index": args.index, "filler": args.filler}
 
     rec["provenance"] = provenance_manifest(args, exl_ext.exllamav3_ext)
+    # ---- optional, opt-in layer-0 diagnostic capture. Default behaviour is untouched: without
+    # --capture-dir no seam is patched and no artifact is written.
+    capture_dir = getattr(args, "capture_dir", None)
+    capture_positions = tuple(int(x) for x in str(getattr(args, "capture_positions", "7,8,9"))
+                              .split(",") if x.strip())
+    captures = {}
+    if capture_dir:
+        from exllamav3.modules.gated_delta_net import GatedDeltaNet, GDNState, GDNLayerState
+        import capture_layer0
+        rec["layer0_capture_config"] = {"dir": capture_dir, "positions": list(capture_positions),
+                                        "layer": args.capture_layer,
+                                        "device": args.capture_device,
+                                        "device_index": args.capture_device_index}
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
     tok = Tokenizer.from_config(config)
@@ -741,7 +803,16 @@ def run(args) -> dict:
 
     def run_generator(name, num_draft, target_cache, max_new):
         recorder = ProbeRecorder(model, P, capture_pred_indices=(args.index,))
+        capture = None
+        if capture_dir:
+            capture = capture_layer0.Layer0Capture(
+                os.path.join(capture_dir, "ar" if not num_draft else "mtp"),
+                mode=("ar" if not num_draft else "mtp"),
+                cache_id=id(target_cache), layer=args.capture_layer,
+                positions=capture_positions)
         originals = hook_model(recorder, Model)
+        if capture is not None:
+            capture.install(GatedDeltaNet, GDNState, GDNLayerState)
         try:
             kw = ({"draft_model": draft, "draft_cache": draft_cache,
                    "num_draft_tokens": num_draft, "record_draft_stats": True} if num_draft else {})
@@ -763,10 +834,20 @@ def run(args) -> dict:
             return recorder, generated, [list(map(int, x)) for x in (getattr(job, "draft_stats", []) or [])]
         finally:
             unhook_model(Model, originals)
+            if capture is not None:
+                # write whatever was recorded before the run ends; assert_complete() runs on the
+                # success path only, so a model failure is never masked by the diagnostic
+                capture.uninstall(GatedDeltaNet, GDNState, GDNLayerState)
+                captures[name] = {"capture": capture,
+                                  "info": capture.write(f"{name}-layer0")}
 
     runs = {}
     for name, nd in (("gen_ar", 0), ("gen_mtp2", 2)):
         recorder, generated, dstats = run_generator(name, nd, caches[name], args.index + 3)
+        if name in captures:
+            rec.setdefault("layer0_capture", {})[name] = {
+                "summary": captures[name]["capture"].summary(),
+                "artifacts": captures[name]["info"]}
         calls = recorder.target_calls()
         if not calls:
             raise ProbeError(f"{name}: no target calls recorded")
@@ -789,15 +870,24 @@ def run(args) -> dict:
                      "calls": [c.summary() for c in calls]}
         runs[name]["first_callback"] = recorder.first_callback
         runs[name]["n_draft_calls"] = recorder.draft_calls
+        # Persist the completed generator's evidence BEFORE a diagnostic capture-completeness
+        # failure can escape: a capture problem must not discard ids/logits/state that already exist.
         flush_mode_artifacts(args, name, runs[name], P)
         print(f"[probe] flushed {name}: {len(generated)} ids, selected seq={call.seq} row={row}",
               flush=True)
+        if name in captures:
+            captures[name]["capture"].assert_complete()
 
     ar, mtp = runs["gen_ar"], runs["gen_mtp2"]
     if ar["generated"][:args.index] != mtp["generated"][:args.index]:
         raise ContextError("AR and MTP2 prefixes differ before the chosen index; not same-context")
     if len(ar["generated"]) <= args.index or len(mtp["generated"]) <= args.index:
         raise ContextError("a run produced fewer tokens than the chosen index")
+
+    # ---- mandatory layer-0 gate (opt-in with --capture-dir)
+    if capture_dir:
+        rec["layer0_replay"] = layer0_gate(args, captures, exl_ext.exllamav3_ext)
+        print(f"[probe] layer-0 replay: {rec['layer0_replay']['status']}", flush=True)
 
     # ---- controls: the whole reset/allocate/replay/control lifecycle runs inside inference mode.
     # `get_new_state()` -> GDNState.__init__ -> GDNLayerState.clear() -> conv_state[idx].zero_() is a
@@ -1044,11 +1134,23 @@ def main(argv=None) -> int:
     ap.add_argument("--prompt", default="Write a short paragraph about the ocean.")
     ap.add_argument("--out", default=None)
     ap.add_argument("--tensor-dir", default=None)
+    ap.add_argument("--capture-dir", default=None,
+                    help="opt-in: capture layer-0 GDN operands/state here and run the native replay "
+                         "gate (default: no capture, no hooks)")
+    ap.add_argument("--capture-positions", default="7,8,9",
+                    help="pass-entry positions the layer-0 capture records")
+    ap.add_argument("--capture-layer", type=int, default=0)
+    ap.add_argument("--capture-device", default="cuda:0")
+    ap.add_argument("--capture-device-index", type=int, default=None)
     ap.add_argument("--dry-check", action="store_true",
                     help="validate arguments and pure logic only; never imports torch's GPU devices")
     args = ap.parse_args(argv)
     if args.dry_check:
+        positions = [int(x) for x in str(args.capture_positions).split(",") if x.strip()]
         print(json.dumps({"dry_check": "ok", "index": args.index, "filler": args.filler,
+                          "capture": {"dir": args.capture_dir, "positions": positions,
+                                      "layer": args.capture_layer,
+                                      "device": args.capture_device},
                           "argv": sys.argv, "note": "no model, no cache, no device touched"}))
         return 0
     try:
