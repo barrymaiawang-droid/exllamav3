@@ -45,7 +45,8 @@ runtime comes from the core wheel and the compiler/headers from the devel wheel,
   sampling), `window2.sh` (run driver: exclusive preflight, memory guard, fail-fast, run-specific
   state file and deadline watchdog), `cleanup-test.sh` (single kill implementation, reaps the run's
   own process group), `check_harness.py` (static checks), `closure.py` (top-k distributions and
-  dispatch deltas for one short run), `probe_mtp_divergence.py` in ../exl3-bench/ (the rejected  was removed here; see the probe review for why).
+  dispatch deltas for one short run). The rejected probe `probe_mtp_divergence.py` used to live
+  here and has been removed; the reviewed causal probe is `tools/exl3-bench/probe_mtp_causal.py`.
 
 ## Reproduction
 
