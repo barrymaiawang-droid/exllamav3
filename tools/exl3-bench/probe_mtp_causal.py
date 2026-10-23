@@ -554,24 +554,25 @@ def assert_identity_block(call):
 
 
 def issue_control_rows(recorded_call, rows, cache, state, model):
-    """Issue one control pass with explicit row tokens at the recorded pass position."""
+    """Issue one control pass with explicit token rows at the recorded pass position.
+
+    Only the token rows change: `positions` stays the recorded 1-D per-sequence MRoPE base offset
+    (shape (1,)), never expanded to one entry per row.
+    """
     assert_identity_block(recorded_call)
     used = (recorded_call.cache_seqlens + len(rows) + PAGE_SIZE - 1) // PAGE_SIZE
     block = torch.tensor([list(range(used)) + [0] * (len(recorded_call.block_row) - used)], dtype=torch.int32)
-    # the control adds token ROWS, not position entries: positions stays the recorded 1-D
-    # per-sequence base offset (generator.py:1465)
-    positions = list(recorded_call.positions)
-    params = {"attn_mode": "flash_attn", "cache": cache, "block_table": block,
-              "cache_seqlens": torch.tensor([recorded_call.cache_seqlens], dtype=torch.int32),
-              "recurrent_states": [state], "recurrent_history": False, "pinned_staging": True}
-    if positions:
-        params["positions"] = torch.tensor([positions], dtype=torch.int32)
+    params = _replay_params(recorded_call, cache, state, block)
+    if "positions" in params:
+        want = list(recorded_call.positions)
+        got = tuple(params["positions"].shape)
+        if got != (len(want),):
+            raise ParamError(f"control positions must keep the recorded 1-D shape ({len(want)},), got {got}")
+    ids = torch.tensor([list(rows)], dtype=torch.long)
     with torch.inference_mode():
-        out = model.forward(torch.tensor([rows], dtype=torch.long), params)
+        out = model.forward(ids, params)
     return out[0].detach().to(torch.float32).cpu()
 
-
-# ----------------------------------------------------------------------------- report helpers
 
 def full_kl(logits_a: torch.Tensor, logits_b: torch.Tensor) -> dict:
     """KL(p_a || p_b) over the full normalized vocabulary, fp32."""
@@ -593,6 +594,50 @@ def write_json(rec: dict, path: str) -> None:
 
 
 # ----------------------------------------------------------------------------- driver
+
+def flush_mode_artifacts(args, name: str, run: dict, prompt_len: int) -> dict:
+    """Persist one completed generator mode *before* any control runs.
+
+    A later control failure must not discard inference that already succeeded: the generated ids, the
+    selected accepted context/pass/row, the full selected logits and the selected canonical state are
+    written to unique per-run files next to `--out`, never staged or published.
+    """
+    if not getattr(args, "out", None):
+        return {}
+    call, row = run["call"], run["row"]
+    out = {
+        "label": f"mtp-causal-probe-v4-{name}",
+        "generated_ids": run["generated"],
+        "draft_stats": run.get("draft_stats"),
+        "first_callback": run.get("first_callback"),
+        "selected": {"seq": call.seq, "method": call.method, "row": row,
+                     "cache_seqlens": call.cache_seqlens, "rows": call.rows,
+                     "history": call.recurrent_history,
+                     "predicted_index": predict_index(call.cache_seqlens, row, prompt_len),
+                     "accepted_context_tail": call.input_ids[0][: row + 1],
+                     "context_including_row_len": call.cache_seqlens + row + 1},
+        "discarded_candidates": run.get("discarded", []),
+        "n_target_calls": run.get("n_target_calls"),
+        "n_draft_calls": run.get("n_draft_calls"),
+        "logits": {"sha256": _sha(run["logits"]), "numel": int(run["logits"].numel()),
+                   "top5": [int(x) for x in torch.topk(run["logits"].flatten(), 5).indices]},
+        "entry_state": summarize_snapshot(call.entry_state),
+        "kv_at_frontier": {k: v["k_sha256"] for k, v in (call.live_kv or {}).get("layers", {}).items()},
+        "calls": [c.summary() for c in run["records"]],
+    }
+    write_json(out, f"{args.out}.{name}.json")
+    tdir = getattr(args, "tensor_dir", None)
+    if tdir:
+        os.makedirs(tdir, exist_ok=True)
+        payload = {"prompt_ids": None, "generated_ids": run["generated"],
+                   "selected_logits": run["logits"]}
+        torch.save(payload, os.path.join(tdir, f"{name}-selected.pt"))
+        if call.entry_state is not None:
+            for key, layer in sorted(call.entry_state["layers"].items())[:2]:
+                torch.save({"conv": layer["_conv"], "base": layer["_base"]},
+                           os.path.join(tdir, f"{name}-state-{str(key).replace('/', '_').replace(' ', '')}.pt"))
+    return out
+
 
 def provenance_manifest(args, ext_module=None) -> dict:
     """Startup identity written before any allocation: sources, extension, script and the runtime
@@ -742,6 +787,11 @@ def run(args) -> dict:
                                   "input_ids": call.input_ids},
                      "n_target_calls": len(calls), "n_draft_calls": recorder.draft_calls,
                      "calls": [c.summary() for c in calls]}
+        runs[name]["first_callback"] = recorder.first_callback
+        runs[name]["n_draft_calls"] = recorder.draft_calls
+        flush_mode_artifacts(args, name, runs[name], P)
+        print(f"[probe] flushed {name}: {len(generated)} ids, selected seq={call.seq} row={row}",
+              flush=True)
 
     ar, mtp = runs["gen_ar"], runs["gen_mtp2"]
     if ar["generated"][:args.index] != mtp["generated"][:args.index]:
@@ -749,22 +799,21 @@ def run(args) -> dict:
     if len(ar["generated"]) <= args.index or len(mtp["generated"]) <= args.index:
         raise ContextError("a run produced fewer tokens than the chosen index")
 
-    # ---- control seq: replay the recorded AR protocol verbatim, stopping AT the selected call
-    seq_cache = caches["seq"]
-    seq_cache.reset_states()
-    seq_state = seq_cache.get_new_state()
-    seq_entry, seq_kv, seq_logits = None, None, None
-    for call in ar["records"]:
-        if call.seq == ar["call"].seq:
-            seq_entry = snapshot_state(seq_state)                     # live replay frontier
-            seq_kv = kv_fingerprint(seq_cache, call.cache_seqlens, call.block_row)
-            out = replay_one(call, seq_cache, seq_state, model)
-            seq_logits = out[ar["row"]]
-            break                                                     # never replay past the selected pass
-        replay_one(call, seq_cache, seq_state, model)
-    if seq_logits is None or seq_entry is None or seq_kv is None:
-        raise ProbeError("seq control did not reach the selected pass")
-    rec["seq"] = {"replayed_calls": ar["call"].seq + 1,
+    # ---- controls: the whole reset/allocate/replay/control lifecycle runs inside inference mode.
+    # `get_new_state()` -> GDNState.__init__ -> GDNLayerState.clear() -> conv_state[idx].zero_() is a
+    # real in-place write on inference tensors; window 1792766228047680624-502983 died exactly there.
+    seq_cache, b3_cache = caches["seq"], caches["batch3"]
+    with torch.inference_mode():
+        _, seq_entry, seq_kv, seq_logits, replayed = replay_to_selected(
+            ar["records"], ar["call"], ar["row"], seq_cache, model)
+        b3_state, b3_replayed = replay_prefix_control(ar["records"], ar["call"].seq, b3_cache, model)
+        b3_entry = snapshot_state(b3_state)
+        b3_kv = kv_fingerprint(b3_cache, ar["call"].cache_seqlens, ar["call"].block_row)
+        row0 = ar["call"].input_ids[0][0]
+        b3_logits_all = issue_control_rows(ar["call"], [row0, args.filler, args.filler],
+                                           b3_cache, b3_state, model)
+    b3_logits = b3_logits_all[0]
+    rec["seq"] = {"replayed_calls": replayed,
                   "selected_logits_sha": _sha(seq_logits),
                   "entry_state": summarize_snapshot(seq_entry), "kv": seq_kv,
                   "live_kv_matches_recorded": (
@@ -802,19 +851,6 @@ def run(args) -> dict:
         raise ProbeError("replay self-check failed (logits_exact=%s state_equal=%s); refusing to "
                          "report causal numbers" % (selfcheck_logits, selfcheck_state))
 
-    # ---- control batch3: same prefix, then the same pass position with three rows
-    b3_cache = caches["batch3"]
-    b3_cache.reset_states()
-    b3_state = b3_cache.get_new_state()
-    for call in ar["records"]:
-        if call.seq >= ar["call"].seq:
-            break
-        replay_one(call, b3_cache, b3_state, model)
-    b3_entry = snapshot_state(b3_state)
-    b3_kv = kv_fingerprint(b3_cache, ar["call"].cache_seqlens, ar["call"].block_row)
-    row0 = ar["call"].input_ids[0][0]
-    b3_logits = issue_control_rows(ar["call"], [row0, args.filler, args.filler],
-                                   b3_cache, b3_state, model)[0]
     try:
         control_prerequisites("batch3 prefix vs AR frontier", seq_entry, b3_entry, seq_kv, b3_kv, prereq)
     except ProbeError as exc:
@@ -920,6 +956,44 @@ def _replay_params(call, cache, state, block):
     for key, value in (call.extra or {}).items():
         params.setdefault(key, value)      # e.g. last_tokens_only, replayed verbatim
     return params
+
+
+def replay_to_selected(records, selected, row, cache, model):
+    """Reset/allocate the control state and replay up to the selected pass (inclusive).
+
+    The reset and the state allocation issue real cache operations (`GDNLayerState.clear()` ->
+    `conv_state[idx].zero_()`), which fail on inference tensors outside inference mode, so the caller
+    must run this whole lifecycle inside `torch.inference_mode()`.
+    """
+    cache.reset_states()
+    state = cache.get_new_state()
+    entry = kv = logits = None
+    for call in records:
+        if call.seq == selected.seq:
+            entry = snapshot_state(state)
+            kv = kv_fingerprint(cache, call.cache_seqlens, call.block_row)
+            out = replay_one(call, cache, state, model)
+            if out is None:
+                raise ProbeError("selected pass returned no logits")
+            logits = out[row]
+            break
+        replay_one(call, cache, state, model)
+    if entry is None or kv is None or logits is None:
+        raise ProbeError("seq control did not reach the selected pass")
+    return state, entry, kv, logits, selected.seq + 1
+
+
+def replay_prefix_control(records, stop_before, cache, model):
+    """Reset/allocate and replay the calls strictly before `stop_before`; returns the live state."""
+    cache.reset_states()
+    state = cache.get_new_state()
+    n = 0
+    for call in records:
+        if call.seq >= stop_before:
+            break
+        replay_one(call, cache, state, model)
+        n += 1
+    return state, n
 
 
 def replay_one(call, cache, state, model):

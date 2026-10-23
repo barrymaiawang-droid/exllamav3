@@ -139,6 +139,7 @@ def real_layer_state(GDNLayerState, fdim=6, kernel=4, max_history=3, heads=2, kd
     ls.conv_state = torch.zeros((1, fdim, kernel + max_history), dtype=torch.bfloat16)
     ls.recurrent_state = torch.zeros((2, 1, heads, kdim, vdim), dtype=torch.float16)
     ls.g_width = heads
+    ls.device = torch.device("cpu")      # the real clear() writes only when a device is set
     return ls
 
 
@@ -157,14 +158,30 @@ class FakeRecurrentLayers(dict):
 
 
 class FakeCache:
-    """Holds real KV layers and real GDN layer states; no model, no device."""
+    """Holds real KV layers and real GDN layer states; no model, no device.
 
-    def __init__(self, gdn, fp16, n_kv=2, n_gdn=2, seed=0):
+    `get_new_state()` constructs the **real** `GDNState`, so `GDNLayerState.clear()` ->
+    `conv_state[idx].zero_()` runs exactly as in the failing window. With `inference_tensors=True` the
+    state tensors are created inside inference mode, i.e. they are inference tensors: the clear then
+    raises unless the caller is inside `torch.inference_mode()`, which is the regression the window hit.
+    """
+
+    def __init__(self, gdn, fp16, n_kv=2, n_gdn=2, seed=0, inference_tensors=False):
         self.initialized = True
         self.layers = {(i * 4, 0): real_kv_layer(seed=seed) for i in range(n_kv)}
-        self.recurrent_layers = {(i * 4, 0): real_layer_state(gdn["GDNLayerState"]) for i in range(n_gdn)}
+        self.inference_tensors = inference_tensors
+        self.recurrent_layers = {(i * 4, 0): self._layer_state(gdn["GDNLayerState"])
+                                 for i in range(n_gdn)}
         self._GDNState = gdn["GDNState"]
+        self.model = types.SimpleNamespace(loaded_tp=False)
         self.states = []
+        self.state_alloc_in_inference = []   # every state allocation must happen under inference mode
+
+    def _layer_state(self, GDNLayerState):
+        if self.inference_tensors:
+            with torch.inference_mode():
+                return real_layer_state(GDNLayerState)
+        return real_layer_state(GDNLayerState)
 
     def get_all_recurrent_layers(self):
         return self.recurrent_layers
@@ -173,7 +190,9 @@ class FakeCache:
         self.states = []
 
     def get_new_state(self):
-        st = real_state(self._GDNState, self, slot=len(self.states))
+        # the real constructor: asserts position 0, then clears every recurrent layer (in-place writes)
+        self.state_alloc_in_inference.append(torch.is_inference_mode_enabled())
+        st = self._GDNState(self, len(self.states), 0)
         self.states.append(st)
         return st
 
@@ -196,6 +215,7 @@ class FakeModel:
         self.corrupt_after = 1 if corrupt else None
         self.counts = {}
         self.corruptions = []          # (cache_seqlen, row, call-count) actually flipped, for the tests
+        self.seen_params = []          # (method, input shape, positions shape) for shape assertions
 
     def _logits(self, cache_seqlen, rows):
         out = torch.full((1, rows, VOCAB), -10.0)
@@ -219,6 +239,8 @@ class FakeModel:
 
     def prefill(self, input_ids, params):
         """Model.prefill: writes cache/state, advances recurrence, returns no logits."""
+        self.seen_params.append(("prefill", tuple(input_ids.shape),
+                                 tuple(params["positions"].shape) if params.get("positions") is not None else None))
         if getattr(self, "require_inference", False) and not torch.is_inference_mode_enabled():
             raise RuntimeError("Inplace update to inference tensor outside InferenceMode is not allowed.")
         self.prefill_calls = getattr(self, "prefill_calls", 0) + 1
@@ -226,6 +248,8 @@ class FakeModel:
         return None
 
     def forward(self, input_ids, params):
+        self.seen_params.append(("forward", tuple(input_ids.shape),
+                                 tuple(params["positions"].shape) if params.get("positions") is not None else None))
         if getattr(self, "require_inference", False) and not torch.is_inference_mode_enabled():
             raise RuntimeError("Inplace update to inference tensor outside InferenceMode is not allowed.")
         seqlen = int(params["cache_seqlens"].reshape(-1)[0])
@@ -315,6 +339,7 @@ class FakeGenerator:
         self.generated = []
         self.done = False
 
+    @torch.inference_mode()          # the real Generator runs its queue under inference mode
     def enqueue(self, job):
         self.job = job
         self.state = self.cache.get_new_state()
@@ -330,6 +355,7 @@ class FakeGenerator:
                   "last_tokens_only": last_only, "pinned_staging": True}
         return self.model.forward(torch.tensor([rows], dtype=torch.long), params)
 
+    @torch.inference_mode()          # generator.py:626/815/889 decorate the real iteration paths
     def iterate(self):
         if self.done:
             return []
@@ -408,7 +434,7 @@ def install_fake_api(monkeypatch, target, draft):
 # --------------------------------------------------------------------- driver fixture
 
 def run_driver(monkeypatch, gdn, fp16, out_path, corrupt=(), holder=None, corrupt_conv=False,
-               fail_fast=None):
+               fail_fast=None, inference_tensors=False):
     target = FakeModel(target=True, corrupt=set(corrupt), corrupt_conv=corrupt_conv)
     if holder is not None:
         holder["target"] = target
@@ -592,6 +618,59 @@ def test_full_driver_prefill_entrypoint_matches_the_source_dispatch(monkeypatch,
         assert all(len(p) == 1 for p in positions), positions[:3]
 
 
+def test_control_lifecycle_runs_under_inference_mode_with_real_inference_tensors(monkeypatch, gdn, fp16,
+                                                                                tmp_path):
+    """Regression for window 1792766228047680624-502983.
+
+    The control cache holds real inference tensors, and `get_new_state()` is the real `GDNState`
+    constructor, whose `GDNLayerState.clear()` writes `conv_state[idx].zero_()` in place. Outside
+    inference mode that is exactly the RuntimeError the window raised *before* `replay_one` ran, so this
+    test fails unless the whole reset/allocate/replay/control lifecycle is inside `torch.inference_mode()`.
+    """
+    # the fixture itself must reproduce the failing operation: outside inference mode the real
+    # GDNState constructor's clear() writes conv_state[idx].zero_() on an inference tensor and raises
+    probe_cache = FakeCache(gdn, fp16, inference_tensors=True)
+    probe_cache.reset_states()
+    with pytest.raises(RuntimeError) as direct:
+        probe_cache.get_new_state()
+    assert "inference tensor" in str(direct.value)
+
+    rec, caches, target = run_driver(monkeypatch, gdn, fp16, tmp_path / "probe.json",
+                                     inference_tensors=True)
+    # every control state allocation (and therefore the real clear()) ran under inference mode
+    flags = [f for cache in caches.values()
+             for f in getattr(cache, "state_alloc_in_inference", [])]
+    assert len(flags) >= 4, f"expected the generator and control state allocations, got {flags}"
+    assert all(flags), f"a state was allocated outside inference mode: {flags}"
+    assert rec["replay_selfcheck"]["logits_exact"] is True
+    assert rec["kv_ar_vs_mtp2"]["equal"] is True
+    # the control really was a 3-row pass with a 1-entry per-sequence offset
+    control = [p for p in target.seen_params if p[1] == (1, 3)]
+    assert control, f"no 3-row control pass was issued: {target.seen_params[-4:]}"
+    assert control[-1][2] == (1,), f"positions must stay 1-D per sequence, got {control[-1][2]}"
+
+
+def test_mode_artifacts_are_flushed_before_controls(monkeypatch, gdn, fp16, tmp_path):
+    """Completed inference must survive a later control failure."""
+    out = tmp_path / "probe.json"
+    rec, caches, target = run_driver(monkeypatch, gdn, fp16, out)
+    for name in ("gen_ar", "gen_mtp2"):
+        art = f"{out}.{name}.json"
+        assert os.path.exists(art), f"{name} was not flushed"
+        data = json.load(open(art))
+        assert data["generated_ids"][:5] == rec[name]["generated_ids"][:5]
+        assert data["selected"]["row"] == rec["selection"][
+            "ar" if name == "gen_ar" else "mtp2"]["row"]
+        assert data["logits"]["sha256"] and data["logits"]["numel"] > 0
+        assert data["entry_state"]["position"] == data["selected"]["cache_seqlens"]
+
+    # a later control failure keeps both flushed captures on disk
+    out2 = tmp_path / "probe2.json"
+    with pytest.raises(probe.ProbeError):
+        run_driver(monkeypatch, gdn, fp16, out2, corrupt_conv=True)
+    assert os.path.exists(f"{out2}.gen_ar.json") and os.path.exists(f"{out2}.gen_mtp2.json")
+
+
 def test_replay_runs_under_inference_mode(gdn, fp16):
     """The loaded model's tensors are inference tensors; replay outside inference mode is a real crash
     (window 1792766228047680624-502983). Both entrypoints must be replayed inside the context."""
@@ -642,7 +721,7 @@ def test_unexpected_exception_leaves_an_error_artifact(monkeypatch, gdn, fp16, t
 
         class DriverCache(FakeCache):
             def __init__(self, *a, **kw):
-                super().__init__(gdn, fp16)
+                super().__init__(gdn, fp16, inference_tensors=False)
 
         pkg.Cache = DriverCache
         monkeypatch.setattr(sys, "argv", argv)
