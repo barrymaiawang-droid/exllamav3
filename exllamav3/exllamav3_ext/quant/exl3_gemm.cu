@@ -12,6 +12,7 @@ namespace cg = cooperative_groups;
 #include "exl3_devctx.cuh"
 #include "exl3_gemv.cuh"
 #include "exl3_gemv_int8.cuh"
+#include "exl3_dispatch_stats.cuh"
 #include "coop_autotune.cuh"
 #if defined(USE_ROCM)
     #include "../rocm/quant/exl3_mgemv_rdna.cuh"
@@ -212,6 +213,7 @@ int exl3_gemm_gr
         ))
         {
             cuda_check(cudaPeekAtLastError());
+            exl3_dispatch_stats::bump_m(size_m);
             return 92;
         }
     }
@@ -224,7 +226,10 @@ int exl3_gemm_gr
     if (mul1 && exl3_gemv_int8_enabled())
     {
         if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
+        {
+            exl3_dispatch_stats::bump(exl3_dispatch_stats::GEMM_INT8_GEMV);
             return 0;
+        }
     }
 
     int block_dim;
@@ -274,6 +279,7 @@ int exl3_gemm_gr
             ))
             {
                 cuda_check(cudaPeekAtLastError());
+                exl3_dispatch_stats::bump(exl3_dispatch_stats::GEMM_RDNA_GEMV_GRAPH);
                 return 91;
             }
         }
@@ -290,6 +296,7 @@ int exl3_gemm_gr
             {
                 add_graph_args(gemv_kernel);
                 cuda_check(cudaPeekAtLastError());
+                exl3_dispatch_stats::bump(exl3_dispatch_stats::GEMM_RDNA_GEMV_EAGER);
                 return 90;
             }
         }
@@ -319,6 +326,7 @@ int exl3_gemm_gr
         {
             add_graph_args((void*) tuned.kernel);
             cuda_check(cudaPeekAtLastError());
+            exl3_dispatch_stats::bump(exl3_dispatch_stats::GEMM_COOP);
             return tuned.tag;
         }
         std::vector<CoopAutotuneCandidate> candidates;
@@ -373,6 +381,7 @@ int exl3_gemm_gr
         if (graph)
         add_graph_args((void*) tuned.kernel);
         cuda_check(cudaPeekAtLastError());
+        exl3_dispatch_stats::bump(exl3_dispatch_stats::GEMM_COOP);
         return tuned.tag;
     }
 
@@ -680,6 +689,7 @@ int exl3_mgemm_gr
             device, stream, graph
         ))
         {
+            exl3_dispatch_stats::bump(exl3_dispatch_stats::MGEMV_RDNA_MULTIROW);
             cuda_check(cudaPeekAtLastError());
             return 93;
         }
@@ -696,6 +706,7 @@ int exl3_mgemm_gr
             device, stream, graph
         ))
         {
+            exl3_dispatch_stats::bump(exl3_dispatch_stats::MGEMV_RDNA_PLAIN);
             cuda_check(cudaPeekAtLastError());
             return 0;
         }
@@ -758,6 +769,8 @@ int exl3_mgemm_gr
         if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, smem_max, stream, &tuned))
         {
             add_graph_args((void*) tuned.kernel);
+            exl3_dispatch_stats::bump(had_src_list ? exl3_dispatch_stats::MGEMV_SLICED_COOP
+                                                   : exl3_dispatch_stats::MGEMV_COOP);
             cuda_check(cudaPeekAtLastError());
             return tuned.tag;
         }
@@ -790,6 +803,8 @@ int exl3_mgemm_gr
 
             tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, smem_max, stream, (size_t) size_k * size_n * bszm);
             add_graph_args((void*) tuned.kernel);
+            exl3_dispatch_stats::bump(had_src_list ? exl3_dispatch_stats::MGEMV_SLICED_COOP
+                                                   : exl3_dispatch_stats::MGEMV_COOP);
 
             // DBGI10(size_m, size_k, size_n, K, bszm_in, bszm_out, tuned.tag, tuned.block_dim, tuned.num_sms, tuned.concurrency);
 
